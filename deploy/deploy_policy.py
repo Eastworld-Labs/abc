@@ -141,6 +141,7 @@ def _configure_process(cfg: DeployConfig) -> None:
     environment = {
         "DEPLOY_VERBOSE": "1" if cfg.verbose else None,
         "DEPLOY_INIT_Q": cfg.init_q or None,
+        "DEPLOY_KP_SCALE": cfg.kp_scale or None,
         "DEPLOY_POST_VIDEO": None if cfg.post_video else "0",
     }
     for key, value in environment.items():

@@ -1,3 +1,4 @@
+import json
 import logging
 import os
 import time
@@ -216,7 +217,8 @@ class YAMFollowerNode(Node):
             self.get_joint_pos(),
         )
 
-        self.robot.update_kp_kd(default_kp, default_kd)
+        kp_scale = np.asarray(json.loads(os.environ.get("DEPLOY_KP_SCALE") or "1.0"))
+        self.robot.update_kp_kd(default_kp * kp_scale, default_kd)
 
     def tick(self) -> None:
         command, extras = self.subscribe(self.leader_topic_name)

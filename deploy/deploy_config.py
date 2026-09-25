@@ -28,6 +28,8 @@ class DeployConfig:
     execute_chunk_dim: int = 16
     compress_images: bool = False
     init_q: str = ""
+    kp_scale: str = ""
+    """JSON list of 7 follower kp multipliers (6 joints, gripper), applied to both arms."""
 
     remote_host: str = ""
     port: int = 8000
