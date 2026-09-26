@@ -32,6 +32,32 @@ CUDA_VISIBLE_DEVICES=0 uv run deploy/serve_policy.py --policy.checkpoint-path=ca
 Then run the robot side with `--remote-host=<gpu-host>`. Add
 `--compress-images` when network bandwidth or latency is limited.
 
+## DAgger checkpoints
+
+Five real-robot ABC-DiT finetunes that we improved with DAgger on our own
+station. `prepare.py` downloads one (~8.1 GB, sha256-verified) and prints the
+deploy command it was run with:
+
+```bash
+uv run prepare.py --dagger-checkpoint folding_paper_box
+```
+
+| Checkpoint | Task | Step | Stiffness |
+| --- | --- | --- | --- |
+| `folding_paper_box` | fold the paper box | 75k | default |
+| `insert_earbuds_1eb` | insert the earbuds into their charging case (one earbud) | 5k | default |
+| `insert_earbuds_3eb` | insert the earbuds into their charging case (three earbuds) | 5k | default |
+| `using_a_key` | unlock a box with a key | 5k | 2x kp |
+| `pack_student_bag` | pack a student bag | 10k | 2x kp |
+
+All five run with 5 diffusion steps, RTC (prefix 4, lead 4, 20 actions per
+chunk) and a task-specific `--init-q`. `using_a_key` and `pack_student_bag`
+were trained on recordings made with doubled arm stiffness, so their commands
+add `--kp-scale='[2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 1.0]'` (follower kp multipliers
+for the six joints and the gripper, applied to both arms). The DAgger data was
+collected without the standard cage, so expect them to need adapting on other
+setups.
+
 ## VLA inference
 
 ABC-VLA is served through the same websocket protocol;

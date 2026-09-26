@@ -278,7 +278,9 @@ documented in the [abc_sim README](abc_sim/README.md#sim-eval).
 
 The deployment stack, including RTC, teleoperation, and recording, is
 documented in [`deploy/README.md`](deploy/README.md). Install its optional
-hardware dependencies with `uv sync --extra deploy`.
+hardware dependencies with `uv sync --extra deploy`. Our five real-robot
+[DAgger checkpoints](deploy/README.md#dagger-checkpoints) download with
+`uv run prepare.py --dagger-checkpoint <name>`.
 
 ## Episode exports & training data format
 
@@ -301,8 +303,8 @@ sharded downloads, and subtask/operator conditioning are documented in the
 
 The project code is Apache-2.0 ([`LICENSE`](LICENSE)), with third-party
 components covered by the licenses listed below. The published DiT checkpoints
-`bottles_75k.pt` and `abc_dit_xl_200k_model.pt` are Apache-2.0.
-Both checkpoints embed a DINOv3-derived vision backbone, so the DINOv3 use
+`bottles_75k.pt`, `abc_dit_xl_200k_model.pt` and the DAgger checkpoints are
+Apache-2.0. All of them embed a DINOv3-derived vision backbone, so the DINOv3 use
 restrictions below apply to the weights as well as to the code that loads them.
 
 The released VLA checkpoints (including `vla_abc130k_200000_v2.pt`, the

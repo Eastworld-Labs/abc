@@ -57,6 +57,17 @@ PRETRAINED_META_KEY = "checkpoints/abc_dit_xl_200k_model.json"
 PRETRAINED_DST = "abc_dit_xl_200k_model.pt"
 PRETRAINED_META_FORMAT = "abc_checkpoint_metadata/v1"
 
+# Real-robot DAgger finetunes of ABC-DiT (model-only, fp32 weights, ~8.1 GB each).
+# Each <name>.json sidecar carries the sha256 and the deploy flags it was run with.
+DAGGER_KEY_PREFIX = "checkpoints/dagger"
+DaggerCheckpoint = Literal[
+    "folding_paper_box",
+    "insert_earbuds_1eb",
+    "insert_earbuds_3eb",
+    "using_a_key",
+    "pack_student_bag",
+]
+
 # Released weights-only VLA parents. The default is the abc130k 200k checkpoint:
 # it shares the released DiT parent's five-task sim mixture, while vla_200k was
 # trained on the earlier xdof-only mixture and therefore has no declared abc_sim
@@ -222,6 +233,13 @@ class PrepareConfig:
         Literal[50000, 100000, 200000],
         tyro.conf.arg(help="Published VLA step selected by --vla-pretrained."),
     ] = 200000
+    dagger_checkpoint: Annotated[
+        tuple[DaggerCheckpoint, ...],
+        tyro.conf.arg(
+            help="Download these real-robot DAgger checkpoints (~8.1 GB each, "
+            "sha256-verified) and print their deploy commands. Skips the dataset."
+        ),
+    ] = ()
     cache: Annotated[
         Path,
         tyro.conf.arg(help=f"Where to put files; defaults to ABC_CACHE or {DEFAULT_CACHE}."),
@@ -751,6 +769,32 @@ def fetch_vla_pretrained(cache, config: PrepareConfig):
             "[pretrained-vla] no abc_sim task bundle is declared for this "
             f"{meta.get('training_mixture', family)!r} training mixture"
         )
+
+
+def _deploy_flag(key, value):
+    flag = "--" + key.replace("_", "-")
+    if value is True:
+        return flag
+    return f"{flag}={shlex.quote(json.dumps(value) if isinstance(value, list) else str(value))}"
+
+
+def fetch_dagger_checkpoints(cache, names):
+    """Download DAgger checkpoints and print the deploy command each was run with."""
+    for name in names:
+        dst = cache / "dagger" / f"{name}.pt"
+        meta = _load_checkpoint_metadata(
+            f"{DAGGER_KEY_PREFIX}/{name}.json", dst.with_suffix(".json")
+        )
+        print(f"[dagger] {meta['uri']} ({meta['bytes']/1e9:.1f} GB)")
+        download_url(meta["uri"], dst, expected=meta["bytes"])
+        verify_sha256(dst, meta["sha256"], dst.name)
+        print(f"[dagger] sha256 ok, step {meta['step']}, licence {meta['license']}")
+        try:
+            display_dst = dst.relative_to(REPO_ROOT)
+        except ValueError:
+            display_dst = dst
+        flags = " ".join(_deploy_flag(k, v) for k, v in meta["deploy"].items())
+        print(f"[deploy] uv run deploy/deploy_policy.py --checkpoint-path {display_dst} {flags}")
 
 
 def sha256_file(path):
@@ -1372,6 +1416,10 @@ def main(config: PrepareConfig):
             "--sim-bundle, --sim-package or --sim-data"
         )
     cache = config.cache.expanduser().resolve()
+    if config.dagger_checkpoint:
+        fetch_dagger_checkpoints(cache, config.dagger_checkpoint)
+        if not (sim_requested or config.full or config.checkpoint or pretrained_requested):
+            return
     sim_failures = 0
     if sim_requested:
         # Assets first: --sim-data installs its tasks' packages as well, and the meshes
