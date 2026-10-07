@@ -32,6 +32,55 @@ CUDA_VISIBLE_DEVICES=0 uv run deploy/serve_policy.py --policy.checkpoint-path=ca
 Then run the robot side with `--remote-host=<gpu-host>`. Add
 `--compress-images` when network bandwidth or latency is limited.
 
+## Serving robot_class's YAM runner
+
+`deploy/serve_robot_class.py` serves ABC-DiT to the bimanual YAM runner in
+`robot_class` (`inference/yam/run.py --remote-host`), which speaks openpi's
+websocket protocol. The policy runs in this process; only key names and image
+layout are translated (`head_cam`/`wrist_left`/`wrist_right` HWC frames to
+ABC's `top`/`left`/`right` CHW, RTC leftover to the DiT action prefix). The
+action and state spaces already match: 14-D left-first joints plus gripper at
+30 Hz. DiT only; the VLA is not exposed through this adapter.
+
+Chunked execution:
+
+```bash
+# abc
+CUDA_VISIBLE_DEVICES=0 uv run deploy/serve_robot_class.py \
+    --policy.checkpoint-path=cache/bottles_75k.pt --policy.diffusion-steps=10 \
+    --policy.prompt='throw plastic bottles in bin'
+
+# robot_class (dry run; add --enable-motion once the actions look sane)
+python -m inference.yam.run --left-channel can_follower_l --right-channel can_follower_r \
+    --remote-host 127.0.0.1 --control-mode joint --execution-horizon 16 \
+    --prompt 'throw plastic bottles in bin'
+```
+
+RTC: the server fixes the execution horizon and inference delay and sends
+them to the runner in its metadata, so pass `--rtc` on both sides:
+
+```bash
+# abc
+CUDA_VISIBLE_DEVICES=0 uv run deploy/serve_robot_class.py \
+    --policy.checkpoint-path=cache/bottles_75k.pt --policy.diffusion-steps=5 \
+    --policy.prompt='throw plastic bottles in bin' \
+    --rtc --execution-horizon=16 --inference-delay=6
+
+# robot_class
+python -m inference.yam.run --left-channel can_follower_l --right-channel can_follower_r \
+    --remote-host 127.0.0.1 --control-mode joint --rtc \
+    --prompt 'throw plastic bottles in bin'
+```
+
+`--inference-delay` must cover one request: at 30 Hz each step is 33 ms, so a
+~110 ms request (5 diffusion steps, RTX 5080, no `--policy.fast-inference`)
+needs at least 4; use ~8 for 10 steps (~200 ms). `execution_horizon +
+inference_delay` must not exceed the 30-action chunk. Turn off head-camera
+depth in robot_class's `configs/yam_cameras.yaml` (`enable_depth: false`); the
+DiT does not use it. For zero-shot use, match the ABC station: a top camera and
+two wrist cameras at 640x480, and start from ABC's `init_q`
+(`[0, 0.5, 1.0, -1.0, 0, 0, 1.0]` per arm) rather than robot_class's home pose.
+
 ## DAgger checkpoints
 
 Five real-robot ABC-DiT finetunes that we improved with DAgger on our own
