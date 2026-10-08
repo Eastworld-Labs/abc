@@ -86,6 +86,26 @@ episode_<uuid>/
 
 The mp4 is encoded in a manner that allows for efficient dataloading. For details, see the ABC paper.
 
+### Converting LeRobot v3.0 YAM datasets
+
+`scripts/export_lerobot.py` converts bimanual YAM LeRobot v3.0 datasets (one
+folder per task, `head_cam`/`wrist_left`/`wrist_right`, 14-D state/action in
+ABC's joint order) into the same layout. Whole episodes are split into
+`train_real/` and `val_real/` by `scripts/yam_split.json` (95/5, seed 42, made by
+`scripts/make_yam_split.py`),
+skipping its `excluded_episodes`. Each episode's LeRobot task string becomes its
+`task_name` (`"Fold Handkerchief"` -> prompt `fold handkerchief`):
+
+```bash
+# smoke test: one train + one val episode per task
+uv run --with pyarrow scripts/export_lerobot.py --out-dir /nvme/abc_yam --max-episodes 1
+# everything
+uv run --with pyarrow scripts/export_lerobot.py --out-dir /nvme/abc_yam --root /path/to/yam --workers 32
+```
+
+Then train every task together with `--mixture-preset yam` (all of
+`train_real/` and `val_real/`, sampled in proportion to frame count).
+
 ## Multi-node training
 
 For multi-node jobs without a shared filesystem, predownload a deterministic

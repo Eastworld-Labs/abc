@@ -135,6 +135,12 @@ MIXTURE_PRESETS: dict[str, list[MixtureComponent]] = {
     "sim_task": [
         MixtureComponent("train_sim", "val_sim", 1.0, ""),
     ],
+    # Multi-task YAM finetuning on episodes from scripts/export_lerobot.py:
+    # every task shares train_real/ and val_real/, and each episode's metadata
+    # task_name drives its prompt.
+    "yam": [
+        MixtureComponent("train_real", "val_real", 1.0, ""),
+    ],
 }
 
 
@@ -158,7 +164,7 @@ class TrainConfig:
     num_workers: int = 16
     train_steps: int = 75_000
 
-    mixture_preset: Literal["bottles", "tshirt", "sim_task"] = "bottles"
+    mixture_preset: Literal["bottles", "tshirt", "sim_task", "yam"] = "bottles"
     mixture: list[MixtureComponent] = field(default_factory=list)
 
     load_pretrained: bool = False
