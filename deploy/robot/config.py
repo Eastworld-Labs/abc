@@ -22,6 +22,16 @@ class LeaderConfig:
     control_rate: int = 400
     servo_ids: tuple[int, ...] = (40, 41, 42, 43, 44, 45, 46)
     joint_signs: tuple[int, ...] = (1, -1, -1, -1, 1, 1, 1)
+    # "dynamixel": GELLO on a serial port (device_name, servo_ids, joint_signs).
+    # "yam": a YAM arm with an i2rt teaching handle on CAN `channel`, in
+    # gravity compensation (see leaders/yam_leader.py); no signs or offsets,
+    # it shares the follower's joint frame.
+    kind: str = "dynamixel"
+    channel: str = ""
+    # "yam" only: the key ("a"/"b"/"c", as the pedal sends) each teaching-handle
+    # button [top, second] emits; "" leaves a button unused. Lets one operator run
+    # DAgger from the handles without a foot pedal.
+    buttons: tuple[str, ...] = ()
 
 
 @dataclass
@@ -141,6 +151,50 @@ _DEFAULT_INIT_Q = {
     "left": [0.0, 0.5, 1.0, -1.0, 0.0, 0.0, 1.0],
     "right": [0.0, 0.5, 1.0, -1.0, 0.0, 0.0, 1.0],
 }
+# Median first state of the 241 unfold recordings: arms at the i2rt home pose
+# (all joints near zero), grippers open.
+_EW_YAM_INIT_Q = {
+    "left": [0.007, 0.018, 0.017, -0.079, 0.014, -0.014, 1.0],
+    "right": [-0.014, 0.019, 0.017, -0.083, -0.039, 0.012, 1.0],
+}
+
+
+# Teaching-handle buttons [top, second] -> DAgger keys. The right thumb does the
+# frequent ones (a: start / take over / hand back; c: checkpoint / save), the left
+# top button ends the episode (b), so ending can't be hit while toggling takeovers.
+_YAM_HANDLE_BUTTONS = {"left": ("b", ""), "right": ("a", "c")}
+
+
+def _yam_leader_profile(
+    *,
+    camera_serials: tuple[str, str, str],
+    follower_channels: tuple[str, str],
+    leader_channels: tuple[str, str],
+    init_q: dict[str, list[float]],
+    gripper_type: str = "linear_4310",
+) -> RobotSystemConfig:
+    """A station whose leaders are YAM arms with teaching handles and whose CAN
+    interfaces carry fixed udev names rather than the can_<side>_foll defaults."""
+    profile = _profile(
+        camera_serials=camera_serials,
+        leader_devices=("", ""),
+        init_q=init_q,
+        can_serials=("", "", "", ""),
+        gripper_type=gripper_type,
+    )
+    for side, follower_channel, leader_channel in zip(
+        ("left", "right"), follower_channels, leader_channels, strict=True
+    ):
+        robot = profile.robots[side]
+        robot.follower.channel = follower_channel
+        robot.leader = LeaderConfig(
+            device_name="",
+            control_rate=200,
+            kind="yam",
+            channel=leader_channel,
+            buttons=_YAM_HANDLE_BUTTONS[side],
+        )
+    return profile
 _BBOX_CAN = (
     "00370039594E501820313332",
     "005300195842500620383152",
@@ -215,6 +269,15 @@ PROFILES = {
             "",
             "005300195842500620383152",
         ),
+    ),
+    # EW station yam-007: YAM leaders with teaching handles, udev-named CAN
+    # interfaces (/etc/udev/rules.d/80-yam-can.rules), D455 head + D405 wrists
+    # (same serials as robot_class's configs/yam_cameras.yaml there).
+    "yam007_config": _yam_leader_profile(
+        camera_serials=("260722303224", "352122272270", "352122273271"),
+        follower_channels=("can_follower_l", "can_follower_r"),
+        leader_channels=("can_leader_l", "can_leader_r"),
+        init_q=_EW_YAM_INIT_Q,
     ),
 }
 

@@ -8,9 +8,12 @@ deploy policy so ABC's own WebsocketPolicyServer answers it in-process; only
 key names and image layout are translated.
 """
 
+import json
 import logging
 import os
+import time
 from dataclasses import dataclass, field
+from pathlib import Path
 
 import numpy as np
 import tyro
@@ -46,6 +49,10 @@ class Args:
     inference_delay: int = 6
     """RTC: control steps one request may take (x33 ms at 30 Hz). The actions
     executed meanwhile become the DiT's RTC prefix."""
+    trace_path: str | None = None
+    """Optional JSONL file of observed joints and predicted actions for diagnosis."""
+    trace_interval: float = 2.0
+    """Minimum seconds between trace records; 0 records every request."""
 
     def dit_config(self) -> PolicyConfig:
         return PolicyConfig(
@@ -58,11 +65,23 @@ class Args:
 class RobotClassPolicy:
     """Translate openpi-format YAM observations to the DiT deploy contract."""
 
-    def __init__(self, policy: Policy, inference_delay: int) -> None:
+    def __init__(
+        self, policy: Policy, inference_delay: int, *,
+        trace_path: str | None = None, trace_interval: float = 2.0,
+    ) -> None:
+        if trace_interval < 0:
+            raise ValueError("--trace-interval must be >= 0")
         self._policy = policy
         self._inference_delay = inference_delay
+        self._trace_path = Path(trace_path).expanduser() if trace_path else None
+        self._trace_interval = trace_interval
+        self._last_trace = float("-inf")
+        self._requests = 0
+        if self._trace_path is not None:
+            self._trace_path.parent.mkdir(parents=True, exist_ok=True)
 
     def infer(self, obs: dict, **_) -> dict:
+        started = time.perf_counter() if self._trace_path is not None else 0.0
         prev_chunk = obs.pop("_rtc_prev_chunk_left_over", None)
         obs.pop("_rtc_prev_chunk_left_over_state", None)
 
@@ -89,7 +108,41 @@ class RobotClassPolicy:
             prefix_length=self._inference_delay if prev_chunk is not None else None,
         )
         actions = result["actions"]
+        self._write_trace(dit_obs, actions, prev_chunk is not None, started)
         return {"actions": actions, "raw_actions": actions}
+
+    def _write_trace(self, obs: dict, actions, rtc: bool, started: float) -> None:
+        if self._trace_path is None:
+            return
+        self._requests += 1
+        now = time.perf_counter()
+        if now - self._last_trace < self._trace_interval:
+            return
+        self._last_trace = now
+        state = np.asarray(obs["state"])
+        actions = np.asarray(actions)
+        record = {
+            "request": self._requests,
+            "time_unix": time.time(),
+            "prompt": obs.get("prompt"),
+            "adapter_inference_ms": (now - started) * 1000,
+            "rtc_prefix_length": self._inference_delay if rtc else 0,
+            "state": state.tolist(),
+            "actions": actions.tolist(),
+            "finite": bool(np.isfinite(actions).all()),
+        }
+        if state.shape == (14,) and actions.ndim == 2 and actions.shape[1] == 14:
+            joint_indices = [*range(6), *range(7, 13)]
+            for index in (0, 15, 29):
+                if index < len(actions):
+                    record[f"max_joint_delta_rad_at_{index}"] = float(
+                        np.abs(actions[index, joint_indices] - state[joint_indices]).max()
+                    )
+        try:
+            with self._trace_path.open("a") as output:
+                output.write(json.dumps(record) + "\n")
+        except OSError:
+            logging.getLogger(__name__).warning("Could not write inference trace", exc_info=True)
 
 
 def server_metadata(args: Args) -> dict:
@@ -103,10 +156,30 @@ def server_metadata(args: Args) -> dict:
     if args.rtc:
         metadata["execution_horizon"] = args.execution_horizon
         metadata["inference_delay"] = args.inference_delay
+    metadata["server_identity"] = server_identity(args)
     return metadata
 
 
+def server_identity(args: Args) -> dict:
+    """What a replay must match to reproduce this server's outputs. The DiT starts from
+    zero noise, so given the same request it needs no seed."""
+    import torch
+
+    return {
+        "family": "abc-dit",
+        "checkpoint": str(args.policy.checkpoint_path),
+        "diffusion_steps": args.policy.diffusion_steps,
+        "fast_inference": args.policy.fast_inference,
+        "device": torch.cuda.get_device_name() if torch.cuda.is_available() else "cpu",
+        "torch_version": torch.__version__,
+        "rtc": args.rtc,
+        "inference_delay": args.inference_delay if args.rtc else None,
+    }
+
+
 def main(args: Args) -> None:
+    if args.trace_interval < 0:
+        raise ValueError("--trace-interval must be >= 0")
     level = logging.INFO if os.environ.get("DEPLOY_VERBOSE") else logging.WARNING
     logging.basicConfig(level=level, force=True)
     chunk_len = args.dit_model.chunk_length
@@ -132,7 +205,10 @@ def main(args: Args) -> None:
     )
     print(f"[serve_robot_class] serving on 0.0.0.0:{args.port}")
     WebsocketPolicyServer(
-        policy=RobotClassPolicy(policy, args.inference_delay),
+        policy=RobotClassPolicy(
+            policy, args.inference_delay,
+            trace_path=args.trace_path, trace_interval=args.trace_interval,
+        ),
         host="0.0.0.0",
         port=args.port,
         metadata=server_metadata(args),

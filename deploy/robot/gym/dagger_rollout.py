@@ -56,20 +56,34 @@ class DaggerRolloutConfig:
 
 
 class PedalInput:
-    def __init__(self, context: zmq.Context, topic: str = "KeyListener_key_presses"):
-        self.socket = comms.create_subscriber(context, topic)
+    """a/b/c presses from the key listener (keyboard or foot pedal) and from the
+    YAM teaching-handle buttons (``<leader>_buttons``, see leaders/yam_leader.py).
+    A topic nobody publishes is simply silent, so GELLO stations are unaffected."""
+
+    def __init__(
+        self,
+        context: zmq.Context,
+        topics: tuple[str, ...] = (
+            "KeyListener_key_presses",
+            "dagger_gello_left_buttons",
+            "dagger_gello_right_buttons",
+        ),
+    ):
+        self.sockets = [comms.create_subscriber(context, topic) for topic in topics]
 
     def poll(self) -> list[str]:
         keys = []
-        while self.socket.poll(timeout=0):
-            _, extras = comms.subscribe(self.socket)
-            key = str(extras.get("key", "")).lower()
-            if extras.get("pressed", True) and key in {"a", "b", "c"}:
-                keys.append(key)
+        for socket in self.sockets:
+            while socket.poll(timeout=0):
+                _, extras = comms.subscribe(socket)
+                key = str(extras.get("key", "")).lower()
+                if extras.get("pressed", True) and key in {"a", "b", "c"}:
+                    keys.append(key)
         return keys
 
     def close(self) -> None:
-        self.socket.close()
+        for socket in self.sockets:
+            socket.close()
 
 
 class RelativeGelloController:

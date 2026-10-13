@@ -2,7 +2,7 @@
 # requires-python = ">=3.10"
 # dependencies = ["numpy", "pyarrow", "tyro"]
 # ///
-"""Convert LeRobot v3.0 bimanual YAM datasets into the training data layout.
+"""Convert LeRobot v2.1 or v3.0 bimanual YAM datasets into the training data layout.
 
 Thin CLI over abc_minimal/export_lerobot.py; runs standalone via `uv run` (the
 header above pins the only dependencies — no torch environment needed).

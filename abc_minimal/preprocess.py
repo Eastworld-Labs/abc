@@ -86,6 +86,9 @@ def resize_pad_raw(img_chw, target_h=224, target_w=224):
     Where the VLA image path stops: SigLIP owns mean/std. DiT continues
     through resize_pad_normalize.
     """
+    # Websocket decoding can return a read-only view of the message bytes.
+    if isinstance(img_chw, np.ndarray) and not img_chw.flags.writeable:
+        img_chw = img_chw.copy()
     x = torch.as_tensor(img_chw).float()
     if x.max() > 1.0:
         x = x / 255.0

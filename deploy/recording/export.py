@@ -38,6 +38,7 @@ import shutil
 import subprocess
 from dataclasses import dataclass, field
 from datetime import datetime
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Literal
 
@@ -348,29 +349,60 @@ def _segment_ranges(
     return rio.true_ranges(mask), valid_ranges
 
 
-def export_recordings(cfg: ExportConfig) -> dict:
-    output_root = Path(cfg.output_dir).expanduser().resolve()
-    if output_root.exists():
-        if not cfg.overwrite:
-            raise FileExistsError(f"{output_root} exists; pass --overwrite to replace")
-        shutil.rmtree(output_root)
-    train_dir = output_root / "train"
-    train_dir.mkdir(parents=True)
+@dataclass
+class Segment:
+    """One exportable span of a recording, on its synced camera timeline.
 
-    norm_stats = resolve_norm_stats(cfg)
-    summary: dict = {
-        "input_pattern": cfg.input_pattern,
-        "mode": cfg.mode,
-        "state_label": rio.canonical_state(cfg.state_label),
-        "modified_after": cfg.modified_after,
-        "collection_name": cfg.collection_name,
-        "exported_episodes": [],
-        "skipped_segments": [],
-        "skipped_files": [],
-    }
-    state_stats = RunningStats()
-    action_stats = RunningStats()
+    ``states``/``actions``/``labels`` cover the whole synced timeline; the segment
+    is ``[start, end)``. ``f`` stays open only while the generator is suspended on
+    this segment, so consume it before advancing.
+    """
 
+    f: h5py.File
+    synced: rio.SyncedRecording
+    h5_path: str
+    episode_id: str
+    start: int
+    end: int
+    states: np.ndarray
+    actions: np.ndarray
+    labels: np.ndarray
+    task_name: str
+    recording_type: str
+    mode: str
+
+    @property
+    def n_frames(self) -> int:
+        return self.end - self.start
+
+    @property
+    def provenance(self) -> dict:
+        return {
+            "source_h5": self.h5_path,
+            "recording_type": self.recording_type,
+            "export_mode": self.mode,
+            "frame_range": [self.start, self.end],
+            "avg_sync_hz": self.synced.avg_hz,
+        }
+
+    def summary_entry(self) -> dict:
+        ts = self.synced.base_ts_ns
+        return {
+            "episode_id": self.episode_id,
+            "source": self.h5_path,
+            "recording_type": self.recording_type,
+            "frames": self.n_frames,
+            "start_time_s": float((ts[self.start] - ts[0]) * 1e-9),
+        }
+
+
+def iter_segments(cfg, summary: dict) -> Iterator[Segment]:
+    """Yield every segment ``cfg`` selects, recording skips in ``summary``.
+
+    Shared by this exporter and ``export_lerobot.py`` so both formats export exactly
+    the same frames: file filters, discard decisions, intervention labels, context
+    padding and ``min_segment_frames``.
+    """
     for h5_path in select_files(cfg, summary):
         with h5py.File(h5_path, "r") as f:
             if rio.is_unusable(f):
@@ -412,6 +444,7 @@ def export_recordings(cfg: ExportConfig) -> dict:
                 print(f"[skip] {h5_path}: no {mode} segments")
                 continue
 
+            labels = rio.dagger_state_labels(f, synced.base_ts_ns)
             task_name = cfg.task_name or rio.decode_attr(f.attrs.get("task_name", ""))
             basename = Path(h5_path).stem
             for segment_index, (raw_start, raw_end) in enumerate(ranges):
@@ -441,39 +474,62 @@ def export_recordings(cfg: ExportConfig) -> dict:
                     )
                     continue
 
-                provenance = {
-                    "source_h5": h5_path,
-                    "recording_type": recording_type,
-                    "export_mode": mode,
-                    "frame_range": [start, end],
-                    "avg_sync_hz": synced.avg_hz,
-                }
-                write_episode(
-                    f,
-                    synced,
-                    cfg,
-                    train_dir / episode_id,
-                    start,
-                    end,
-                    states,
-                    actions,
-                    task_name,
-                    provenance,
+                yield Segment(
+                    f=f,
+                    synced=synced,
+                    h5_path=h5_path,
+                    episode_id=episode_id,
+                    start=start,
+                    end=end,
+                    states=states,
+                    actions=actions,
+                    labels=labels,
+                    task_name=task_name,
+                    recording_type=recording_type,
+                    mode=mode,
                 )
-                state_stats.update(states[start:end])
-                action_stats.update(actions[start:end])
-                summary["exported_episodes"].append(
-                    {
-                        "episode_id": episode_id,
-                        "source": h5_path,
-                        "recording_type": recording_type,
-                        "frames": n_frames,
-                        "start_time_s": float(
-                            (synced.base_ts_ns[start] - synced.base_ts_ns[0]) * 1e-9
-                        ),
-                    }
-                )
-                print(f"[export] {episode_id}: {n_frames} frames")
+
+
+def export_recordings(cfg: ExportConfig) -> dict:
+    output_root = Path(cfg.output_dir).expanduser().resolve()
+    if output_root.exists():
+        if not cfg.overwrite:
+            raise FileExistsError(f"{output_root} exists; pass --overwrite to replace")
+        shutil.rmtree(output_root)
+    train_dir = output_root / "train"
+    train_dir.mkdir(parents=True)
+
+    norm_stats = resolve_norm_stats(cfg)
+    summary: dict = {
+        "input_pattern": cfg.input_pattern,
+        "mode": cfg.mode,
+        "state_label": rio.canonical_state(cfg.state_label),
+        "modified_after": cfg.modified_after,
+        "collection_name": cfg.collection_name,
+        "exported_episodes": [],
+        "skipped_segments": [],
+        "skipped_files": [],
+    }
+    state_stats = RunningStats()
+    action_stats = RunningStats()
+
+    for seg in iter_segments(cfg, summary):
+        write_episode(
+            seg.f,
+            seg.synced,
+            cfg,
+            train_dir / seg.episode_id,
+            seg.start,
+            seg.end,
+            seg.states,
+            seg.actions,
+            seg.task_name,
+            seg.provenance,
+        )
+        state_stats.update(seg.states[seg.start : seg.end])
+        action_stats.update(seg.actions[seg.start : seg.end])
+        summary["exported_episodes"].append(seg.summary_entry())
+        print(f"[export] {seg.episode_id}: {seg.n_frames} frames")
 
     if not summary["exported_episodes"]:
         (output_root / "export_summary.json").write_text(

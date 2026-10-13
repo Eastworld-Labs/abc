@@ -11,7 +11,9 @@ class DaggerConfig(DeployConfig):
     collection_name: str = "dagger"
     data_root_directory: str = "./data/dagger_h5"
 
-    foot_pedal_device: str = "/dev/input/by-id/usb-PCsensor_FootSwitch-event-kbd"
+    foot_pedal_device: str | None = None
+    """None: use the PCsensor pedal when it is plugged in, else keyboard only.
+    A path requires that device; '' forces keyboard only."""
     grab_foot_pedal: bool = True
 
     gello_stale_timeout: float = 0.2

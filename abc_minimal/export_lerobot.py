@@ -1,4 +1,4 @@
-"""Convert LeRobot v3.0 bimanual YAM datasets into the training data layout.
+"""Convert LeRobot v2.1 or v3.0 bimanual YAM datasets into the training data layout.
 
 Reads one LeRobot dataset per task (``<root>/<repo>/{data,meta,videos}``),
 splits whole episodes into train/val with a split file, and writes each episode
@@ -44,7 +44,7 @@ SPLIT_DIRS = {"train": "train_real", "val": "val_real"}
 
 @dataclass
 class ExportLerobotConfig:
-    """Convert LeRobot v3.0 YAM datasets into ABC train_real/ and val_real/."""
+    """Convert LeRobot v2.1/v3.0 YAM datasets into ABC train_real/ and val_real/."""
 
     out_dir: Path
     """Cache root to write into; episodes land in <out_dir>/{train_real,val_real}/."""
@@ -60,6 +60,10 @@ class ExportLerobotConfig:
     workers: int = 8
     overwrite: bool = False
     """Re-export episodes whose states_actions.bin already exists."""
+    task_name: str | None = None
+    """Give every exported episode this task_name (and so this prompt) instead of
+    its LeRobot task string, e.g. 'unfold' for a dataset whose strings carry
+    operator names ('Unfold - Joe'). The original string stays in source.task."""
 
 
 def task_slug(task: str) -> str:
@@ -67,12 +71,29 @@ def task_slug(task: str) -> str:
     return re.sub(r"[^a-z0-9]+", "_", task.strip().lower()).strip("_")
 
 
-def read_episode_index(dataset: Path) -> dict[int, dict]:
-    """Episode rows from meta/episodes/*/*.parquet, keyed by episode_index."""
+def read_episode_index(dataset: Path, info: dict) -> dict[int, dict]:
+    """Episode rows keyed by episode_index, in the v3.0 row layout.
+
+    v3.0 reads meta/episodes/*/*.parquet. v2.1 keeps one parquet and one mp4
+    per episode, so its meta/episodes.jsonl rows get the v3.0 location fields
+    filled in: chunk = episode // chunks_size, file 0, video start 0.
+    """
     rows = {}
-    for path in sorted((dataset / "meta" / "episodes").glob("*/*.parquet")):
-        for row in pq.read_table(path).to_pylist():
-            rows[int(row["episode_index"])] = row
+    if info["codebase_version"] == "v3.0":
+        for path in sorted((dataset / "meta" / "episodes").glob("*/*.parquet")):
+            for row in pq.read_table(path).to_pylist():
+                rows[int(row["episode_index"])] = row
+        return rows
+    for line in (dataset / "meta" / "episodes.jsonl").read_text().splitlines():
+        row = json.loads(line)
+        ep = int(row["episode_index"])
+        chunk = ep // int(info["chunks_size"])
+        row.update({"data/chunk_index": chunk, "data/file_index": 0})
+        for _, feature in CAMERAS:
+            row.update({f"videos/{feature}/chunk_index": chunk,
+                        f"videos/{feature}/file_index": 0,
+                        f"videos/{feature}/from_timestamp": 0.0})
+        rows[ep] = row
     return rows
 
 
@@ -89,8 +110,8 @@ def plan_jobs(config: ExportLerobotConfig) -> list[tuple]:
             raise ValueError(f"{repo} is not in {config.split_file}")
         dataset = root / repo
         info = json.loads((dataset / "meta" / "info.json").read_text())
-        if info.get("codebase_version") != "v3.0" or info.get("fps") != FPS:
-            raise ValueError(f"{repo}: expected LeRobot v3.0 at {FPS} fps")
+        if info.get("codebase_version") not in ("v2.1", "v3.0") or info.get("fps") != FPS:
+            raise ValueError(f"{repo}: expected LeRobot v2.1 or v3.0 at {FPS} fps")
         for key in (STATE_KEY, ACTION_KEY):
             if tuple(info["features"][key]["names"]) != JOINT_NAMES:
                 raise ValueError(f"{repo}: unexpected {key} joint names")
@@ -104,25 +125,28 @@ def plan_jobs(config: ExportLerobotConfig) -> list[tuple]:
                 operator = entry.get("recording_metadata", {}).get("operator_id")
                 if operator:
                     operators[int(idx)] = operator
-        episodes = read_episode_index(dataset)
+        episodes = read_episode_index(dataset, info)
         for split_name in config.splits:
             chosen = [e for e in split["repos"][repo][split_name] if e not in excluded.get(repo, ())]
             for ep in chosen[: config.max_episodes]:
                 out = config.out_dir / SPLIT_DIRS[split_name] / f"episode_{repo}_{ep:04d}"
                 if not config.overwrite and (out / "states_actions.bin").exists():
                     continue
-                jobs.append((str(dataset), info, episodes[ep], operators.get(ep), str(out), repo))
+                jobs.append((str(dataset), info, episodes[ep], operators.get(ep), str(out), repo,
+                             config.task_name))
     return jobs
 
 
 def export_episode(job):
-    dataset, info, row, operator_id, out_dir, repo = job
+    dataset, info, row, operator_id, out_dir, repo, task_name = job
     dataset, out_dir = Path(dataset), Path(out_dir)
     ep, num_steps = int(row["episode_index"]), int(row["length"])
     name = f"{repo}#{ep}"
+    # v2.1 path templates use episode_chunk/episode_index; format() ignores the unused keys.
+    v21_keys = {"episode_chunk": row["data/chunk_index"], "episode_index": ep}
 
     data_path = dataset / info["data_path"].format(
-        chunk_index=row["data/chunk_index"], file_index=row["data/file_index"]
+        chunk_index=row["data/chunk_index"], file_index=row["data/file_index"], **v21_keys
     )
     table = pq.read_table(
         data_path, columns=["episode_index", "frame_index", STATE_KEY, ACTION_KEY],
@@ -149,6 +173,7 @@ def export_episode(job):
                 video_key=feature,
                 chunk_index=row[f"videos/{feature}/chunk_index"],
                 file_index=row[f"videos/{feature}/file_index"],
+                **v21_keys,
             )
             start = float(row[f"videos/{feature}/from_timestamp"])
             mp4 = str(Path(work) / f"{cam_key}.mp4")
@@ -183,10 +208,11 @@ def export_episode(job):
     # Written last: the dataloader only picks up directories with this file,
     # so an interrupted export is never trained on.
     task = row["tasks"][0]
-    meta = {"task_name": task_slug(task), "cameras": [k for k, _ in CAMERAS],
+    meta = {"task_name": task_slug(task_name or task), "cameras": [k for k, _ in CAMERAS],
             "camera_resolutions": {k: [OUT_W, OUT_H] for k, _ in CAMERAS},
             "alignment": "lerobot_frame_index", "tick_ns": TICK_NS, "num_steps": num_steps,
-            "source": {"format": "lerobot_v3.0", "repo": repo, "episode_index": ep, "task": task}}
+            "source": {"format": f"lerobot_{info['codebase_version']}", "repo": repo,
+                       "episode_index": ep, "task": task}}
     if operator_id:
         meta["operator_id"] = operator_id
         (out_dir / "operator.json").write_text(json.dumps({"operator_id": operator_id}))

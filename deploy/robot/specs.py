@@ -48,24 +48,52 @@ def follower_specs(profile, *, quiet: bool) -> list[ProcessSpec]:
     ]
 
 
+def leader_spec(
+    process_name: str,
+    node_name: str,
+    leader,
+    *,
+    quiet: bool,
+    force_feedback: bool = True,
+) -> ProcessSpec:
+    """Launch the leader node for this profile's GELLO kind; it publishes
+    ``<node_name>_actions``."""
+    if leader.kind == "yam":
+        # Gravity-compensated arm; no force feedback.
+        return ProcessSpec(
+            process_name,
+            "deploy.robot.leaders.yam_leader",
+            {
+                "name": node_name,
+                "control_rate": leader.control_rate,
+                "channel": leader.channel,
+                "buttons": tuple(leader.buttons),
+            },
+            quiet=quiet,
+        )
+    if leader.kind != "dynamixel":
+        raise ValueError(f"unknown leader kind {leader.kind!r}")
+    return ProcessSpec(
+        process_name,
+        "deploy.robot.leaders.gello_leader",
+        {
+            "name": node_name,
+            "control_rate": leader.control_rate,
+            "device_name": leader.device_name,
+            "servo_ids": leader.servo_ids,
+            "joint_signs": leader.joint_signs,
+            "force_feedback": force_feedback,
+        },
+        quiet=quiet,
+    )
+
+
 def teleop_specs(profile, *, quiet: bool) -> list[ProcessSpec]:
     specs = []
     for name, robot in profile.robots.items():
-        leader = robot.leader
         specs.extend(
             [
-                ProcessSpec(
-                    f"leader_{name}",
-                    "deploy.robot.leaders.gello_leader",
-                    {
-                        "name": f"leader_{name}",
-                        "control_rate": leader.control_rate,
-                        "device_name": leader.device_name,
-                        "servo_ids": leader.servo_ids,
-                        "joint_signs": leader.joint_signs,
-                    },
-                    quiet=quiet,
-                ),
+                leader_spec(f"leader_{name}", f"leader_{name}", robot.leader, quiet=quiet),
                 _follower_spec(name, robot.follower, quiet=quiet),
             ]
         )

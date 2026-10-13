@@ -7,6 +7,7 @@ from deploy.deploy_policy import (
     _configure_process,
     _prepare_task,
     _recorder_spec,
+    _resolve_policy,
     _server_specs,
 )
 from deploy.robot import launch
@@ -14,23 +15,16 @@ from deploy.robot.config import get_i2rt_config
 from deploy.robot.key_listeners.key_listener_config import KeyListenerConfig
 from deploy.robot.key_listeners.pedal import resolve_foot_pedal_device
 from deploy.robot.launch import ProcessSpec
-from deploy.robot.specs import camera_specs, follower_specs
+from deploy.robot.specs import camera_specs, follower_specs, leader_spec
 
 
 def _gello_spec(cfg: DaggerConfig, profile, side: str) -> ProcessSpec:
-    leader = profile.robots[side].leader
-    return ProcessSpec(
+    return leader_spec(
         f"gello_{side}",
-        "deploy.robot.leaders.gello_leader",
-        {
-            "name": f"dagger_gello_{side}",
-            "control_rate": leader.control_rate,
-            "device_name": leader.device_name,
-            "servo_ids": leader.servo_ids,
-            "joint_signs": leader.joint_signs,
-            "force_feedback": False,
-        },
+        f"dagger_gello_{side}",
+        profile.robots[side].leader,
         quiet=not cfg.verbose,
+        force_feedback=False,
     )
 
 
@@ -85,6 +79,7 @@ def _build_specs(cfg: DaggerConfig) -> list[ProcessSpec]:
 def main(cfg: DaggerConfig) -> int:
     cfg.record = True
     _configure_process(cfg)
+    _resolve_policy(cfg)
     return launch.launch(_build_specs(cfg))
 
 
