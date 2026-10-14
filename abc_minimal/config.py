@@ -17,9 +17,17 @@ def default_cache_root() -> Path:
 
 @dataclass
 class OptimConfig:
-    """AdamW with a linear-warmup-then-constant LR schedule."""
+    """AdamW with a linear-warmup-then-constant LR schedule, optionally ending
+    in a linear decay to zero, plus an optional EMA of the weights."""
     learning_rate: float = 1e-4
     lr_warmup_steps: int = 1000
+    # Fraction of train_steps at the end over which the LR decays linearly to 0
+    # (0 = constant to the end, the paper's schedule). Anneals small-batch
+    # gradient noise out of the final weights.
+    lr_decay_fraction: float = 0.0
+    # EMA of the trainable weights, updated every optimizer step (0 = off).
+    # Saved as <step>_ema_model.pt beside each checkpoint; see ema.py.
+    ema_decay: float = 0.0
     weight_decay: float = 0.01
     adam_beta1: float = 0.9
     adam_beta2: float = 0.95
@@ -161,6 +169,9 @@ class TrainConfig:
     output_dir: str | None = None
     seed: int = 123
     batch_size: int = 90
+    # Micro-batches per optimizer step; the effective batch is
+    # batch_size x data-parallel world x grad_accum_steps.
+    grad_accum_steps: int = 1
     num_workers: int = 16
     train_steps: int = 75_000
 
@@ -378,9 +389,9 @@ def validate_train_config(
         errors.append("--fsdp is VLA-only and excludes --compile-siglip")
 
     if (
-        min(config.batch_size, config.train_steps, config.log_every, config.val_every,
-            config.val_batches, config.ckpt_every, config.flow.num_diffusion_steps,
-            config.flow.num_diffusion_draws) <= 0
+        min(config.batch_size, config.grad_accum_steps, config.train_steps,
+            config.log_every, config.val_every, config.val_batches, config.ckpt_every,
+            config.flow.num_diffusion_steps, config.flow.num_diffusion_draws) <= 0
         or config.num_workers < 0
         or config.flow.max_action_prefix < 0
     ):
@@ -396,6 +407,8 @@ def validate_train_config(
         errors.append(
             "flow probabilities must be in [0, 1] and prefix_noise_scale must be non-negative"
         )
+    if not 0 <= config.optim.lr_decay_fraction <= 1 or not 0 <= config.optim.ema_decay < 1:
+        errors.append("optim.lr_decay_fraction must be in [0, 1] and optim.ema_decay in [0, 1)")
     if config.policy == "vla":
         errors.extend(validate_vla_model_config(config.vla_model))
     else:

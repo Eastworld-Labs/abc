@@ -75,6 +75,29 @@ CUDA_VISIBLE_DEVICES=4,5,6,7 uv run torchrun --standalone --nproc-per-node 4 tra
 - Memory probe: same command with `--train-steps 50 --output-dir checkpoints/probe` and no wandb.
 - Resume: replace `--load-pretrained` with `--resume-from checkpoints/<run>/last.pt`, same `--output-dir`.
 
+### 3a. Small-batch options (off by default)
+
+For 4x A100 40 GB, where the per-GPU batch is far below the paper's (1,440 DiT / 192 VLA):
+
+| Flag | Effect |
+|---|---|
+| `--grad-accum-steps N` | N micro-batches per optimizer step; effective batch = `batch-size x GPUs x N`. Time per step grows ~N x; samples per second do not change. |
+| `--optim.lr-decay-fraction F` | Linear LR decay to 0 over the last F of `--train-steps` (the paper keeps it constant). |
+| `--optim.ema-decay D` | EMA of the weights (e.g. 0.999), sharded across GPUs (DiT ~2 GiB/GPU on 4 GPUs, VLA ~4.3 GiB under `--fsdp`). Each checkpoint also writes `<step>_ema_model.pt` (model-only, deploy-ready) and `last_ema_model.pt`; `--resume-from <step>.pt` restores the EMA from it. Validation numbers are for the raw weights, not the EMA. |
+
+- DiT at batch 16/GPU has under 1 GiB free, so EMA needs `--batch-size 12` (probe first).
+- `--resume-from` warns if `--grad-accum-steps` differs from the checkpoint (the data stream would not line up).
+- Accumulation turns off DDP `static_graph` for the DiT (it cannot record its graph under `no_sync`); FSDP still reduce-scatters every micro-batch so no unsharded gradients are held.
+
+```bash
+# DiT: effective batch 16 x 4 x 4 = 256, decay over the last 15%, EMA
+... train.py --load-pretrained --batch-size 12 --grad-accum-steps 4 \
+  --optim.learning-rate 1e-5 --optim.lr-decay-fraction 0.15 --optim.ema-decay 0.999 ...
+# VLA probe: raise --batch-size until peak ~36 GiB, then set --grad-accum-steps
+... train.py --policy vla --load-pretrained --pretrained-ckpt-name vla_abc130k_200000_v2.pt \
+  --fsdp --flow.num-diffusion-draws 4 --batch-size 8 --train-steps 50 --output-dir checkpoints/vla_probe
+```
+
 ### 3b. Unfold runs (instance 35.86.74.171)
 
 Both use batch 16/GPU, lr 1e-5 (the paper's finetune rate), the single prompt
