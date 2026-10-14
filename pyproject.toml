@@ -60,6 +60,8 @@ include = ["abc_minimal*", "abc_sim*", "deploy*"]
 
 [tool.setuptools.package-data]
 abc_sim = ["models/*.xml", "models/assets_manifest.json"]
+# The Gemma 3 tokenizer ABC-VLA loads from the package (abc_minimal/gemma/config.py).
+"abc_minimal.gemma" = ["tokenizer/*.spiece.model"]
 
 [tool.uv.sources]
 torch = { index = "pytorch-cu128" }
