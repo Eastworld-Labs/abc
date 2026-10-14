@@ -490,9 +490,11 @@ def build_train_loader(config, components, norm_stats, data_scope, resume_step,
     train_ds = MixtureDataset(
         train_components, component_weights, mixture_length, seed=config.seed
     )
+    # The sampler counts micro-batches: each optimizer step takes grad_accum_steps.
+    accum = getattr(config, "grad_accum_steps", 1)
     train_sampler = GlobalStepSampler(
-        start_step=resume_step,
-        stop_step=config.train_steps,
+        start_step=resume_step * accum,
+        stop_step=config.train_steps * accum,
         batch_size=config.batch_size,
         data_rank=data_scope.rank,
         data_world=data_scope.world,

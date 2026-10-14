@@ -10,6 +10,7 @@ conditioned, and the training/sampling forward calls.
 
 import os
 import time
+from contextlib import nullcontext
 from copy import deepcopy
 from dataclasses import asdict
 from pathlib import Path
@@ -27,6 +28,7 @@ from abc_minimal.checkpointing import (
     fsdp_state_dicts,
     restore_training_state,
     save_checkpoint,
+    save_model_only,
     update_last,
 )
 from abc_minimal.config import (
@@ -48,6 +50,7 @@ from abc_minimal.dit import (
     load_pretrained,
     task_name_to_prompt,
 )
+from abc_minimal.ema import ShardedEMA, ema_path
 from abc_minimal.operator import load_operator_label_maps
 from abc_minimal.preprocess import load_norm_stats, parse_norm_stats
 from abc_minimal.vla import VLAPolicy, stack_camera_batch
@@ -323,7 +326,8 @@ def main(config: TrainConfig):
     if config.resume_from:
         resume_ckpt, resume_step = load_checkpoint(config.resume_from)
         check_topology(resume_ckpt, batch_size=config.batch_size,
-                       data_world=data_scope.world, rank=rank)
+                       data_world=data_scope.world,
+                       grad_accum_steps=config.grad_accum_steps, rank=rank)
 
     torch.manual_seed(config.seed + rank)
     np.random.seed(config.seed + rank)
@@ -348,9 +352,7 @@ def main(config: TrainConfig):
             raise ValueError("--fsdp shards across ranks; launch with torchrun --nproc-per-node > 1")
         _shard_vla(model, world, local_world)
     optimizer = _build_optimizer(model, config, is_vla, rank)
-    scheduler = torch.optim.lr_scheduler.LambdaLR(
-        optimizer, lambda step: min((step + 1) / config.optim.lr_warmup_steps, 1.0)
-    )
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, _lr_lambda(config))
     if resume_ckpt is not None:
         restore_training_state(resume_ckpt, optimizer=optimizer, scheduler=scheduler,
                                resume_step=resume_step, rank=rank,
@@ -372,11 +374,28 @@ def main(config: TrainConfig):
             "gradient_as_bucket_view": True,
         }
         if not is_vla:
-            ddp_kwargs.update(static_graph=True, bucket_cap_mb=256)
+            ddp_kwargs.update(bucket_cap_mb=256)
+            # static_graph records the graph on the first backward, which must
+            # sync; under accumulation that backward runs inside no_sync.
+            if config.grad_accum_steps == 1:
+                ddp_kwargs.update(static_graph=True)
         model = DDP(model, **ddp_kwargs)
     module = model.module if isinstance(model, DDP) else model
     if hasattr(module, "_orig_mod"):
         module = module._orig_mod
+
+    ema = None
+    if config.optim.ema_decay > 0:
+        ema = ShardedEMA(module, config.optim.ema_decay, rank=rank, world=world,
+                         sharded_params=fsdp)
+        ema_src = ema_path(config.resume_from) if config.resume_from else None
+        if ema_src is not None and ema_src.exists():
+            ema.load(model_state_dict(torch.load(ema_src, map_location="cpu",
+                                                 mmap=True, weights_only=False)))
+            if rank == 0:
+                print(f"restored EMA from {ema_src}")
+        elif ema_src is not None and rank == 0:
+            print(f"WARNING: no {ema_src.name}; EMA restarts from the resumed weights")
 
     # Conditioning: DiT uses a CLIP text embedder; VLA feeds raw prompts to Gemma.
     embedder = None
@@ -443,6 +462,11 @@ def main(config: TrainConfig):
             f"policy={config.policy} world={world} local_world={local_world} "
             f"data_world={data_scope.world} data_placement={data_scope.placement}"
         )
+        print(f"effective batch {config.batch_size * data_scope.world * config.grad_accum_steps} "
+              f"= {config.batch_size}/rank x {data_scope.world} x {config.grad_accum_steps} accum"
+              + (f"; lr decays to 0 over the last {config.optim.lr_decay_fraction:.0%} of steps"
+                 if config.optim.lr_decay_fraction else "")
+              + (f"; EMA decay {config.optim.ema_decay}" if ema else ""))
 
     flow = {
         "max_action_prefix": config.flow.max_action_prefix,
@@ -453,18 +477,35 @@ def main(config: TrainConfig):
         flow["num_diffusion_draws"] = config.flow.num_diffusion_draws
     model.train()
     global_step = resume_step
+    accum = config.grad_accum_steps
+    micro = 0
+    loss_sum = torch.zeros((), device=device)
     t_last = time.monotonic()
     for batch in train_loader:
         if global_step >= config.train_steps:
             break
         batch = batch_to_device(batch, device, embedder, camera_keys)
-        loss = model(batch, **flow)
-        loss.backward()
+        micro += 1
+        # DDP skips the all-reduce until the last micro-batch. FSDP keeps its
+        # reduce-scatter every micro-batch: skipping it would hold unsharded
+        # gradients (~14 GiB for the VLA) between micro-batches.
+        sync = nullcontext() if micro == accum or not isinstance(model, DDP) else model.no_sync()
+        with sync:
+            micro_loss = model(batch, **flow)
+            (micro_loss / accum).backward()
+        loss_sum += micro_loss.detach()
+        if micro < accum:
+            continue
+        micro = 0
+        loss = loss_sum / accum
+        loss_sum = torch.zeros((), device=device)
         grad_norm = float(torch.nn.utils.clip_grad_norm_(model.parameters(), config.optim.max_grad_norm))
         optimizer.step()
         # Free the gradients now rather than after the next forward: 13.7 GiB less live during it.
         optimizer.zero_grad(set_to_none=True)
         scheduler.step()
+        if ema is not None:
+            ema.update()
         global_step += 1
 
         if global_step % config.log_every == 0:
@@ -495,19 +536,50 @@ def main(config: TrainConfig):
         if global_step % config.ckpt_every == 0 and (fsdp or data_scope.checkpoint_writer):
             # Gathering sharded state is a collective, so every FSDP rank takes part.
             model_state, optimizer_state = fsdp_state_dicts(model, optimizer) if fsdp else (None, None)
+            # Also a collective (broadcast / all-gather), so every rank takes part.
+            ema_state = ema.gather(keep=data_scope.checkpoint_writer) if ema is not None else None
             if data_scope.checkpoint_writer:
                 path = output_dir / f"{global_step}.pt"
                 model_config = asdict(config.vla_model) if is_vla else None
                 save_checkpoint(path, module=module, optimizer=optimizer, scheduler=scheduler,
                                 global_step=global_step, norm_stats=norm_stats,
                                 batch_size=config.batch_size, data_world=data_scope.world,
+                                grad_accum_steps=accum,
                                 model_config=model_config, train_config=asdict(config),
                                 model_state=model_state, optimizer_state=optimizer_state)
                 update_last(output_dir, path)
                 print(f"[rank {rank}] saved {path}")
+                if ema_state is not None:
+                    # Frozen parameters and buffers come from the live model.
+                    full = model_state if model_state is not None else {
+                        k: v.detach().cpu() for k, v in module.state_dict().items()}
+                    full = {**full, **ema_state}
+                    epath = ema_path(path)
+                    save_model_only(epath, model_state=full, global_step=global_step,
+                                    norm_stats=norm_stats, model_config=model_config,
+                                    train_config=asdict(config))
+                    update_last(output_dir, epath, name=ema_path("last.pt").name)
+                    print(f"[rank {rank}] saved {epath}")
+                    del full, ema_state
 
     if distributed:
         dist.destroy_process_group()
+
+
+def _lr_lambda(config):
+    """Linear warmup, constant, then (optionally) a linear decay to 0 over the
+    final ``lr_decay_fraction`` of train_steps. ``step`` counts optimizer steps."""
+    warmup = config.optim.lr_warmup_steps
+    total = config.train_steps
+    decay = round(total * config.optim.lr_decay_fraction)
+
+    def factor(step):
+        scale = min((step + 1) / warmup, 1.0)
+        if decay:
+            scale *= max(0.0, min(1.0, (total - step) / decay))
+        return scale
+
+    return factor
 
 
 def _run_validation(config, module, val_loaders, device, embedder, camera_keys,

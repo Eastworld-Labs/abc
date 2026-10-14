@@ -69,14 +69,17 @@ SPLIT_DIRS = {"train": "train_real", "val": "val_real"}
 # unfold several crumpled towels and pile them up (>= 200 s, always white);
 # nothing lies between 126 s and 228 s, but the raw task_id calls both
 # "unfold_handkerchief". Task id "unfold_linen" (80-540 s, tagged hand_towel,
-# foot_towel or pillow_case) is its own kind, whatever the duration.
+# foot_towel or pillow_case) is its own kind, whatever the duration, and so is
+# task id "flip_parcel" (pull a parcel from a pile, flip it label up, put it on the conveyor).
 KINDS = {
     "handkerchief": "unfold_handkerchief",
     "towel_stack": "unfold_and_stack_towels",
     "linen": "unfold_linen",
+    "flip_parcel": "flip_parcel",
 }
 TOWEL_STACK_MIN_S = 200.0
 LINEN_TASK_ID = "unfold_linen"
+FLIP_PARCEL_TASK_ID = "flip_parcel"
 
 
 @dataclass
@@ -124,6 +127,8 @@ def split_episodes(total: int, val_fraction: float, seed: int) -> tuple[list[int
 def classify(duration_s: float, task_id: str | None = None) -> str:
     if task_id == LINEN_TASK_ID:
         return "linen"
+    if task_id == FLIP_PARCEL_TASK_ID:
+        return "flip_parcel"
     return "towel_stack" if duration_s >= TOWEL_STACK_MIN_S else "handkerchief"
 
 
